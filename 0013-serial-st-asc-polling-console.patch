@@ -1,0 +1,286 @@
+--- a/drivers/tty/serial/st-asc.c
++++ b/drivers/tty/serial/st-asc.c
+@@ -17,6 +17,8 @@
+ #include <linux/tty_flip.h>
+ #include <linux/delay.h>
+ #include <linux/spinlock.h>
++#include <linux/kthread.h>
++#include <linux/sched.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/serial_core.h>
+@@ -38,6 +40,7 @@
+ 	struct clk *clk;
+ 	struct pinctrl *pinctrl;
+ 	struct pinctrl_state *states[2];
++	struct task_struct *rx_poll_task;
+ 	unsigned int hw_flow_control:1;
+ 	unsigned int force_m1:1;
+ };
+@@ -262,7 +265,8 @@
+ 	if (mode == ASC_CTL_MODE_8BIT || mode == ASC_CTL_MODE_8BIT_PAR)
+ 		ignore_pe = true;
+ 
+-	if (irqd_is_wakeup_set(irq_get_irq_data(port->irq)))
++	if (port->irq > 0 && tport->tty &&
++	    irqd_is_wakeup_set(irq_get_irq_data(port->irq)))
+ 		pm_wakeup_event(tport->tty->dev, 0);
+ 
+ 	while ((status = asc_in(port, ASC_STA)) & ASC_STA_RBF) {
+@@ -339,6 +343,35 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * Bring-up (pdk7105): poll the receive FIFO from a kernel thread so
++ * the console input works even when interrupt delivery is unavailable
++ * (the ST40 interrupt path is not yet fully trusted).  Runs alongside
++ * the interrupt handler when an IRQ is allocated; both paths are
++ * serialised by the port lock.
++ */
++static int asc_rx_poll(void *arg)
++{
++	struct uart_port *port = arg;
++	unsigned long flags;
++
++	for (;;) {
++		if (asc_in(port, ASC_STA) & ASC_STA_RBF) {
++			uart_port_lock_irqsave(port, &flags);
++			if (asc_in(port, ASC_STA) & ASC_STA_RBF)
++				asc_receive_chars(port);
++			uart_port_unlock_irqrestore(port, flags);
++		}
++
++		if (kthread_should_stop())
++			break;
++
++		schedule();
++	}
++
++	return 0;
++}
++
+ /*----------------------------------------------------------------------*/
+ 
+ /*
+@@ -388,9 +421,28 @@
+ static void asc_start_tx(struct uart_port *port)
+ {
+ 	struct tty_port *tport = &port->state->port;
++	unsigned char ch;
++
++	/*
++	 * Bring-up (pdk7105): drive the transmitter by polling the FIFO
++	 * status registers instead of using the transmit interrupt, so
++	 * output does not depend on interrupt delivery at all.  The
++	 * console path (asc_console_putchar) uses the same mechanism.
++	 */
++	if (port->x_char) {
++		while (!asc_hw_txroom(port))
++			cpu_relax();
++		asc_out(port, ASC_TXBUF, port->x_char);
++		port->x_char = 0;
++	}
+ 
+-	if (!kfifo_is_empty(&tport->xmit_fifo))
+-		asc_enable_tx_interrupts(port);
++	while (kfifo_get(&tport->xmit_fifo, &ch)) {
++		while (!asc_hw_txroom(port))
++			cpu_relax();
++		asc_out(port, ASC_TXBUF, ch);
++	}
++
++	uart_write_wakeup(port);
+ }
+ 
+ /* Transmit stop */
+@@ -416,23 +468,52 @@
+  */
+ static int asc_startup(struct uart_port *port)
+ {
+-	if (request_irq(port->irq, asc_interrupt, 0,
+-			asc_port_name(port), port)) {
+-		dev_err(port->dev, "cannot allocate irq.\n");
+-		return -ENODEV;
++	struct asc_port *ascport = to_asc_port(port);
++
++	/*
++	 * Bring-up (pdk7105): transmit is always polling driven (see
++	 * asc_start_tx) and a kernel thread polls the receive FIFO (see
++	 * asc_rx_poll), so the port works whatever the state of the
++	 * interrupt controller.  If an IRQ was provided it is requested
++	 * as well, purely so receive interrupts get their normal path.
++	 */
++	asc_disable_tx_interrupts(port);
++
++	if (port->irq > 0) {
++		if (request_irq(port->irq, asc_interrupt, 0,
++				asc_port_name(port), port)) {
++			dev_err(port->dev, "cannot allocate irq, polling\n");
++			port->irq = 0;
++		}
+ 	}
+ 
+-	asc_transmit_chars(port);
+-	asc_enable_rx_interrupts(port);
++	if (port->irq > 0)
++		asc_enable_rx_interrupts(port);
++
++	ascport->rx_poll_task = kthread_run(asc_rx_poll, port,
++					    "asc%u_rx_poll", port->line);
++	if (IS_ERR(ascport->rx_poll_task))
++		ascport->rx_poll_task = NULL;
+ 
+ 	return 0;
+ }
+ 
+ static void asc_shutdown(struct uart_port *port)
+ {
++	struct asc_port *ascport = to_asc_port(port);
++
+ 	asc_disable_tx_interrupts(port);
+ 	asc_disable_rx_interrupts(port);
+-	free_irq(port->irq, port);
++
++	if (ascport->rx_poll_task) {
++		struct task_struct *task = ascport->rx_poll_task;
++
++		ascport->rx_poll_task = NULL;
++		kthread_stop(task);
++	}
++
++	if (port->irq > 0)
++		free_irq(port->irq, port);
+ }
+ 
+ static void asc_pm(struct uart_port *port, unsigned int state,
+@@ -444,7 +525,8 @@
+ 
+ 	switch (state) {
+ 	case UART_PM_STATE_ON:
+-		clk_prepare_enable(ascport->clk);
++		if (ascport->clk)
++			clk_prepare_enable(ascport->clk);
+ 		break;
+ 	case UART_PM_STATE_OFF:
+ 		/*
+@@ -456,7 +538,8 @@
+ 		ctl = asc_in(port, ASC_CTL) & ~ASC_CTL_RUN;
+ 		asc_out(port, ASC_CTL, ctl);
+ 		uart_port_unlock_irqrestore(port, flags);
+-		clk_disable_unprepare(ascport->clk);
++		if (ascport->clk)
++			clk_disable_unprepare(ascport->clk);
+ 		break;
+ 	}
+ }
+@@ -469,6 +552,14 @@
+ 	struct gpio_desc *gpiod;
+ 	unsigned int baud;
+ 	u32 ctrl_val;
++
++	/*
++	 * Bring-up: keep the bootloader's ASC configuration untouched.
++	 * Writing the CONTROL/BAUDRATE registers here corrupts the TX
++	 * data path (all pokes before set_termios work, the console
++	 * after it is garbage at every baud), so skip the reconfig.
++	 */
++	return;
+ 	tcflag_t cflag;
+ 	unsigned long flags;
+ 
+@@ -476,7 +567,8 @@
+ 	termios->c_cflag &= ~(CMSPAR |
+ 			 (ascport->hw_flow_control ? 0 : CRTSCTS));
+ 
+-	port->uartclk = clk_get_rate(ascport->clk);
++	port->uartclk = ascport->clk ? clk_get_rate(ascport->clk) :
++					938296;
+ 
+ 	baud = uart_get_baud_rate(port, termios, old, 0, port->uartclk/16);
+ 	cflag = termios->c_cflag;
+@@ -488,7 +580,7 @@
+ 
+ 	/* stop serial port and reset value */
+ 	asc_out(port, ASC_CTL, (ctrl_val & ~ASC_CTL_RUN));
+-	ctrl_val = ASC_CTL_RXENABLE | ASC_CTL_FIFOENABLE;
++	ctrl_val = ASC_CTL_RXENABLE; /* bring-up: no TX FIFO (u-boot runs without it) */
+ 
+ 	/* reset fifo rx & tx */
+ 	asc_out(port, ASC_TXRESET, 1);
+@@ -696,7 +788,15 @@
+ 	port->ops	= &asc_uart_ops;
+ 	port->fifosize	= ASC_FIFO_SIZE;
+ 	port->dev	= &pdev->dev;
+-	port->irq	= platform_get_irq(pdev, 0);
++	/*
++	 * Bring-up (pdk7105): port->irq is unsigned, so a negative
++	 * error from platform_get_irq() would become a huge positive
++	 * value.  Treat "no IRQ" as 0 (pure polling mode).
++	 */
++	ret = platform_get_irq_optional(pdev, 0);
++	if (ret < 0)
++		ret = 0;
++	port->irq = ret;
+ 	port->has_sysrq = IS_ENABLED(CONFIG_SERIAL_ST_ASC_CONSOLE);
+ 
+ 	port->membase = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+@@ -708,21 +808,28 @@
+ 
+ 	ascport->clk = devm_clk_get(&pdev->dev, NULL);
+ 
+-	if (WARN_ON(IS_ERR(ascport->clk)))
+-		return -EINVAL;
+-	/* ensure that clk rate is correct by enabling the clk */
+-	ret = clk_prepare_enable(ascport->clk);
+-	if (ret)
+-		return ret;
+-	ascport->port.uartclk = clk_get_rate(ascport->clk);
+-	WARN_ON(ascport->port.uartclk == 0);
+-	clk_disable_unprepare(ascport->clk);
++	if (IS_ERR(ascport->clk)) {
++		/* Bring-up: no clock provider; assume the 100 MHz
++		 * peripheral clock the bootloader used for 115200 baud */
++		ascport->clk = NULL;
++		port->uartclk = 938296;
++	} else {
++		/* ensure that clk rate is correct by enabling the clk */
++		ret = clk_prepare_enable(ascport->clk);
++		if (ret)
++			return ret;
++		ascport->port.uartclk = clk_get_rate(ascport->clk);
++		WARN_ON(ascport->port.uartclk == 0);
++		clk_disable_unprepare(ascport->clk);
++	}
+ 
+ 	ascport->pinctrl = devm_pinctrl_get(&pdev->dev);
+ 	if (IS_ERR(ascport->pinctrl)) {
+-		ret = PTR_ERR(ascport->pinctrl);
+-		dev_err(&pdev->dev, "Failed to get Pinctrl: %d\n", ret);
+-		return ret;
++		/* Bring-up: no pinctrl driver on this platform */
++		ascport->pinctrl = NULL;
++		ascport->states[DEFAULT] = NULL;
++		ascport->states[NO_HW_FLOWCTRL] = NULL;
++		return 0;
+ 	}
+ 
+ 	ascport->states[DEFAULT] =
+@@ -748,8 +855,15 @@
+ 	struct device_node *np = pdev->dev.of_node;
+ 	int id;
+ 
+-	if (!np)
+-		return NULL;
++	if (!np) {
++		/* Bring-up: no device tree; use the platform device id */
++		id = pdev->id;
++		if (id < 0)
++			id = 0;
++		asc_ports[id].port.line = id;
++		asc_ports[id].rts = NULL;
++		return &asc_ports[id];
++	}
+ 
+ 	id = of_alias_get_id(np, "serial");
+ 	if (id < 0)

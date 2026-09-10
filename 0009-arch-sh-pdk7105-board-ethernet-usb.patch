@@ -1,0 +1,232 @@
+--- a/arch/sh/boards/Kconfig
++++ b/arch/sh/boards/Kconfig
+@@ -359,6 +359,16 @@
+ 	  Select ST PDK7105 if configuring for a STMicroelectronics PDK7105
+ 	  evaluation board, as used in the NextVOD GB620 (網樂通) set-top box.
+ 
++if SH_ST_PDK7105
++config PDK7105_ETH
++	bool "PDK7105: enable GMAC ethernet device"
++	default n
++	help
++	  Register the stmmaceth (GMAC) platform device.  The probe
++	  currently hangs the box, so this is off by default while the
++	  cause is being tracked down.
++endif
++
+ config SH_APSH4A3A
+ 	bool "AP-SH4A-3A"
+ 	select SH_ALPHA_BOARD
+--- a/arch/sh/boards/board-pdk7105.c
++++ b/arch/sh/boards/board-pdk7105.c
+@@ -30,7 +30,8 @@
+ 
+ /* SoC register bases (physical) ----------------------------------------- */
+ 
+-#define STX7105_SYSCONF_BASE	0xfd000000	/* sysconf / ILC */
++#define STX7105_SYSCONF_BASE	0xfe001000	/* sysconf: SYS_DEV@+000, SYS_STA@+008,
++						 * SYS_CFG@+100 (per stx7105reg.h) */
+ #define STX7105_PIO_BASE	0xfd020000	/* PIO banks, +0x1000 each */
+ #define STX7105_ASC2_BASE	0xfd032000	/* serial console (ASC2) */
+ #define STX7105_GMAC_BASE	0xfd110000	/* STMAC ethernet */
+@@ -94,8 +95,8 @@
+ #define AHB2STBUS_STRAP_OFFSET		0x14
+ #define AHB2STBUS_STRAP_16_BIT		0x04
+ 
+-static void stx7105_usb_wrapper_init(unsigned long wrapper,
+-				     unsigned long protocol)
++static int stx7105_usb_wrapper_init(unsigned long wrapper,
++				    unsigned long protocol)
+ {
+ 	unsigned long req_reg;
+ 	unsigned long reg;
+@@ -112,10 +113,18 @@
+ 
+ 	/* read-ahead on, opcode 5, threshold enable, 3 packets, threshold 7 */
+ 	req_reg = (1 << 21) | (5 << 16) | (1 << 14) | (3 << 9) | 7;
+-	do {
+-		__raw_writel(req_reg, protocol + AHB2STBUS_MSGSIZE_OFFSET);
+-		reg = __raw_readl(protocol + AHB2STBUS_MSGSIZE_OFFSET);
+-	} while ((reg & 0x7fffffff) != req_reg);
++	{
++		unsigned int timeout = 1000000;
++
++		do {
++			__raw_writel(req_reg,
++				     protocol + AHB2STBUS_MSGSIZE_OFFSET);
++			reg = __raw_readl(protocol + AHB2STBUS_MSGSIZE_OFFSET);
++			if (!--timeout)
++				return -ETIMEDOUT;
++		} while ((reg & 0x7fffffff) != req_reg);
++	}
++	return 0;
+ }
+ 
+ /* Platform devices ------------------------------------------------------- */
+@@ -127,10 +136,15 @@
+ 		.flags	= IORESOURCE_MEM,
+ 	},
+ 	[1] = {
+-		.start	= evt2irq(0x1120),	/* UART2 / ASC2 */
++		/* UART2 (ASC2) interrupt: direct INTC2 vector evt 0x1120,
++		 * it does NOT go through the ILC on stx7105. */
++		.start	= evt2irq(0x1120),
+ 		.end	= evt2irq(0x1120),
+ 		.flags	= IORESOURCE_IRQ,
+ 	},
++	/* Bring-up: the driver still works without the IRQ (polling TX
++	 * plus a RX poll thread); if request_irq() fails it silently
++	 * falls back to pure polling. */
+ };
+ 
+ static struct platform_device pdk7105_asc_device = {
+@@ -242,14 +256,34 @@
+ 	.phy_mask = 0,
+ };
+ 
++static struct stmmac_dma_cfg pdk7105_dma_cfg = {
++	.pbl = 32,
++};
++
++/*
++ * MDC clock: the GMAC CSR clock is the 100 MHz IC interface clock.
++ * u-boot drives MDIO with CR=0 (clk/42, ~2.4 MHz); match that.
++ * clk_csr=0x20 sets the MAC_CSR_H_FRQ bit so
++ * stmmac_clk_csr_set() keeps our fixed value (its dynamic selection
++ * would use clk_rate==0 and pick /16 - 6.25 MHz, unreliable), while
++ * (0x20 << 2) & clk_csr_mask == 0 writes CR=0 into the MII address
++ * register, exactly like u-boot.
++ */
+ static struct plat_stmmacenet_data pdk7105_stmmac_data = {
+ 	.bus_id = 0,
+ 	.phy_addr = -1,
+ 	.mac_interface = PHY_INTERFACE_MODE_MII,
+-	.clk_csr = 0,
++	.phy_interface = PHY_INTERFACE_MODE_MII,
++	.has_gmac = 1,
++	.enh_desc = 1,
++	.tx_coe = 1,
++	.bugged_jumbo = 1,
++	.pmt = 1,
++	.clk_csr = 0x20,	/* fixed CR=0: MDC = CSR clock / 42 (u-boot) */
+ 	.mdio_bus_data = &pdk7105_mdio_bus,
+ 	.tx_queues_to_use = 1,
+ 	.rx_queues_to_use = 1,
++	.dma_cfg = &pdk7105_dma_cfg,
+ };
+ 
+ static struct resource pdk7105_stmmac_resources[] = {
+@@ -260,14 +294,16 @@
+ 	},
+ 	[1] = {
+ 		.name	= "macirq",
+-		.start	= ILC_EXT_IRQ(39),	/* GMAC via ILC */
+-		.end	= ILC_EXT_IRQ(39),
++		/* GMAC is a direct INTC2 vector on stx7105 (INTC_VECT(GMAC, 0x12c0)),
++		 * it does NOT go through the ILC. */
++		.start	= evt2irq(0x12c0),
++		.end	= evt2irq(0x12c0),
+ 		.flags	= IORESOURCE_IRQ,
+ 	},
+ };
+ 
+ static struct platform_device pdk7105_stmmac_device = {
+-	.name		= "dwmac-generic",
++	.name		= "stmmaceth",
+ 	.id		= 0,
+ 	.dev.platform_data = &pdk7105_stmmac_data,
+ 	.num_resources	= ARRAY_SIZE(pdk7105_stmmac_resources),
+@@ -280,7 +316,14 @@
+ 	&pdk7105_usb0_ohci_device,
+ 	&pdk7105_usb1_ehci_device,
+ 	&pdk7105_usb1_ohci_device,
++#ifdef CONFIG_PDK7105_ETH
++	/*
++	 * GMAC probe currently hangs the box right after the ASC probe
++	 * (before any stmmaceth output).  Disabled pending debugging;
++	 * enable via CONFIG_PDK7105_ETH once the cause is found.
++	 */
+ 	&pdk7105_stmmac_device,
++#endif
+ };
+ 
+ /* Board initialisation ---------------------------------------------------- */
+@@ -322,31 +365,66 @@
+ 	__raw_writel(1, pio15 + PIO_POUT);
+ }
+ 
++/* Power up a USB port and init its AHB2STBUS wrapper.  This MUST happen
++ * before the controller registers are first read - with the block still
++ * unpowered/unclocked, STBus register reads hang the CPU. */
++static void __init pdk7105_usb_setup(unsigned long wrapper_paddr,
++				     unsigned long protocol_paddr,
++				     const char *name)
++{
++	unsigned long wrapper = (unsigned long)ioremap(wrapper_paddr, 0x100);
++	unsigned long protocol = (unsigned long)ioremap(protocol_paddr, 0x100);
++	int ret;
++
++	if (!wrapper || !protocol)
++		return;
++	ret = stx7105_usb_wrapper_init(wrapper, protocol);
++	if (ret)
++		printk(KERN_WARNING "PDK7105: %s AHB2STBUS wrapper init "
++		       "timed out (%d), port disabled\n", name, ret);
++}
++
+ static int __init pdk7105_devices_setup(void)
+ {
+-	/* USB0 (internal) and USB1 (external) power + wrapper init */
+-	stx7105_usb_power(0, 1);
+-	stx7105_usb_wrapper_init(STX7105_USB0_WRAPPER, STX7105_USB0_PROTOCOL);
++	int ret;
+ 
+-	stx7105_usb_power(1, 1);
+-	stx7105_usb_wrapper_init(STX7105_USB1_WRAPPER, STX7105_USB1_PROTOCOL);
++	/* mem_init has run by now, so ioremap() works (generic route) */
++	stx7105_sysconf = ioremap(STX7105_SYSCONF_BASE, 0x900);
+ 
+ 	/* Provide the ASC console clock from the fixed peripheral clock */
+ 	clk_add_alias(NULL, "st-asc.0", "peripheral_clk", NULL);
+ 
+-	return platform_add_devices(pdk7105_devices,
+-				    ARRAY_SIZE(pdk7105_devices));
++	/* USB: power both ports, then program the STBus protocol wrappers.
++	 * u-boot has already configured the PHYs/clocking. */
++	stx7105_usb_power(0, 1);
++	stx7105_usb_power(1, 1);
++	pdk7105_usb_setup(STX7105_USB0_WRAPPER, STX7105_USB0_PROTOCOL, "usb0");
++	pdk7105_usb_setup(STX7105_USB1_WRAPPER, STX7105_USB1_PROTOCOL, "usb1");
++
++	/* Ethernet PHY reset: the old ST board setup toggles PIO15.5 low/high
++	 * before registering the GMAC, so do the same here. */
++#ifdef CONFIG_PDK7105_ETH
++	pdk7105_phy_reset_pin();
++#endif
++
++	ret = platform_add_devices(pdk7105_devices,
++				   ARRAY_SIZE(pdk7105_devices));
++	return ret;
+ }
+ arch_initcall(pdk7105_devices_setup);
+ 
+ static void __init pdk7105_setup(char **cmdline_p)
+ {
+ 	printk("STMicroelectronics PDK7105 (NextVOD GB620) board initialisation\n");
+-
+-	stx7105_sysconf = ioremap(STX7105_SYSCONF_BASE, 0x900);
+-
+-	pdk7105_asc_pads();
+-	pdk7105_phy_reset_pin();
++	/*
++	 * Bring-up: ioremap() cannot be used before mem_init on this port
++	 * (the IOREMAP_FIXED fixmap route requires X2TLB, which the ST40
++	 * lacks, so ioremap_prot() hits BUG() while mem_init_done is 0).
++	 * u-boot has already configured the ASC pads and reset the PHY,
++	 * so nothing is needed here; the sysconf ioremap and the
++	 * USB/ethernet setup happen in pdk7105_devices_setup()
++	 * (arch_initcall, after mem_init).
++	 */
+ }
+ 
+ /*

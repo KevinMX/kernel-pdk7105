@@ -1,0 +1,117 @@
+--- a/arch/sh/kernel/cpu/sh4/setup-stx7105.c
++++ b/arch/sh/kernel/cpu/sh4/setup-stx7105.c
+@@ -121,18 +121,24 @@
+ 
+ static struct resource stx7105_tmu_resources[] = {
+ 	[0] = {
++		.name	= "TMU",
++		.start	= 0xffd80000,		/* TMU block: TSTR + 3 channels */
++		.end	= 0xffd8002f,
++		.flags	= IORESOURCE_MEM,
++	},
++	[1] = {
+ 		.name	= "TMU0",
+ 		.start	= evt2irq(0x400),
+ 		.end	= evt2irq(0x400),
+ 		.flags	= IORESOURCE_IRQ,
+ 	},
+-	[1] = {
++	[2] = {
+ 		.name	= "TMU1",
+ 		.start	= evt2irq(0x420),
+ 		.end	= evt2irq(0x420),
+ 		.flags	= IORESOURCE_IRQ,
+ 	},
+-	[2] = {
++	[3] = {
+ 		.name	= "TMU2",
+ 		.start	= evt2irq(0x440),
+ 		.end	= evt2irq(0x440),
+@@ -343,7 +349,15 @@
+ void __init plat_irq_setup(void)
+ {
+ 	unsigned long intc2_base = (unsigned long)ioremap(0xfe001000, 0x400);
+-	unsigned long sysconf_base = (unsigned long)ioremap(0xfd000000, 0x900);
++	/*
++	 * Bring-up: the sysconf external-IRQ-pin configuration write is
++	 * disabled.  The correct sysconf block base is 0xfe001000, but
++	 * writing SYSCFG[10] here hung the box before console init on
++	 * an ST40 (cause TBD - possibly a clock/power dependency).
++	 * None of the currently enabled devices use the external IRQ
++	 * pins, so skipping the write is safe.
++	 */
++	unsigned long sysconf_base = (unsigned long)ioremap(0xfe001000, 0x900);
+ 	int i;
+ 
+ 	for (i = 4; i <= 6; i++)
+@@ -353,8 +367,10 @@
+ 		mask_registers[i].clr_reg += intc2_base;
+ 	}
+ 
+-	/* Configure the external interrupt pins as inputs */
+-	__raw_writel(0xf, sysconf_base + 0x140);	/* SYSCFG[10] bits 0-3 */
++	(void)sysconf_base;
++	/* Configure the external interrupt pins as inputs:
++	 * __raw_writel(0xf, sysconf_base + 0x100 + 10 * 4);  -- disabled,
++	 * see comment above. */
+ 
+ 	register_intc_controller(&intc_desc);
+ }
+--- a/drivers/clocksource/sh_tmu.c
++++ b/drivers/clocksource/sh_tmu.c
+@@ -523,20 +523,29 @@
+ 	/* Get hold of clock. */
+ 	tmu->clk = clk_get(&tmu->pdev->dev, "fck");
+ 	if (IS_ERR(tmu->clk)) {
+-		dev_err(&tmu->pdev->dev, "cannot get clock\n");
+-		return PTR_ERR(tmu->clk);
+-	}
++		/*
++		 * Bring-up (pdk7105): this port has no clock provider.
++		 * The STx7105 TMU runs from the 100 MHz IC interface
++		 * clock (CLKA_IC_IF_100, aliased as "module_clk" in the
++		 * ST kernels), which matches the /4 prescaler selected
++		 * below.
++		 */
++		dev_info(&tmu->pdev->dev,
++			 "no fck clock, assuming 100 MHz input clock\n");
++		tmu->clk = NULL;
++		tmu->rate = 100000000 / 4;
++	} else {
++		ret = clk_prepare(tmu->clk);
++		if (ret < 0)
++			goto err_clk_put;
+ 
+-	ret = clk_prepare(tmu->clk);
+-	if (ret < 0)
+-		goto err_clk_put;
+-
+-	/* Determine clock rate. */
+-	ret = clk_enable(tmu->clk);
+-	if (ret < 0)
+-		goto err_clk_unprepare;
++		/* Determine clock rate. */
++		ret = clk_enable(tmu->clk);
++		if (ret < 0)
++			goto err_clk_unprepare;
+ 
+-	tmu->rate = clk_get_rate(tmu->clk) / 4;
++		tmu->rate = clk_get_rate(tmu->clk) / 4;
++	}
+ 
+ 	/* Map the memory resource. */
+ 	ret = sh_tmu_map_memory(tmu);
+@@ -572,9 +581,11 @@
+ 	kfree(tmu->channels);
+ 	iounmap(tmu->mapbase);
+ err_clk_unprepare:
+-	clk_unprepare(tmu->clk);
++	if (tmu->clk)
++		clk_unprepare(tmu->clk);
+ err_clk_put:
+-	clk_put(tmu->clk);
++	if (tmu->clk)
++		clk_put(tmu->clk);
+ 	return ret;
+ }
+ 

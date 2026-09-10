@@ -1,0 +1,691 @@
+--- a/arch/sh/kernel/cpu/irq/Makefile
++++ b/arch/sh/kernel/cpu/irq/Makefile
+@@ -4,3 +4,4 @@
+ #
+ obj-y					+= imask.o
+ obj-$(CONFIG_CPU_HAS_IPR_IRQ)		+= ipr.o
++obj-$(CONFIG_CPU_SUBTYPE_ST40)		+= ilc3.o
+--- a/arch/sh/kernel/cpu/irq/ilc3.c
++++ b/arch/sh/kernel/cpu/irq/ilc3.c
+@@ -0,0 +1,568 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/arch/sh/kernel/cpu/irq/ilc3.c
++ *
++ * Copyright (C) 2009 STMicroelectronics Limited
++ * Author: Stuart Menefy <stuart.menefy@st.com>
++ * Author: Francesco Virlinzi <francesco.virlinzi@st.com>
++ *
++ * May be copied or modified under the terms of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Interrupts routed through the Interrupt Level Controller (ILC3).
++ * Ported to Linux 6.12 for the STx7105 (pdk7105) SoC.
++ */
++
++#include <linux/kernel.h>
++#include <linux/export.h>
++#include <linux/cpu.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/irqchip/chained_irq.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/syscore_ops.h>
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/io.h>
++
++#include <asm/irq-ilc.h>
++
++#include "ilc3.h"
++
++#define DRIVER_NAME "ilc3"
++
++struct ilc_irq {
++	unsigned char priority;
++
++#define ILC_STATE_USED			0x1
++#define ILC_WAKEUP_ENABLED		0x2
++#define ILC_ENABLED			0x4
++
++#define ilc_is_used(_ilc)		(((_ilc)->state & ILC_STATE_USED) != 0)
++#define ilc_set_used(_ilc)		((_ilc)->state |= ILC_STATE_USED)
++#define ilc_set_unused(_ilc)		((_ilc)->state &= ~(ILC_STATE_USED))
++
++#define ilc_set_wakeup(_ilc)		((_ilc)->state |= ILC_WAKEUP_ENABLED)
++#define ilc_reset_wakeup(_ilc)		((_ilc)->state &= ~ILC_WAKEUP_ENABLED)
++#define ilc_wakeup_enabled(_ilc)	(((_ilc)->state & ILC_WAKEUP_ENABLED) != 0)
++
++#define ilc_set_enabled(_ilc)		((_ilc)->state |= ILC_ENABLED)
++#define ilc_set_disabled(_ilc)		((_ilc)->state &= ~ILC_ENABLED)
++#define ilc_is_enabled(_ilc)		(((_ilc)->state & ILC_ENABLED) != 0)
++	unsigned char state;
++
++	unsigned char trigger_mode;
++};
++
++struct ilc {
++	struct list_head list;
++	const char *name;
++	void *base;
++	struct clk *clk;
++	unsigned short inputs_num, outputs_num;
++	unsigned int first_irq;
++	int disable_wakeup;
++	spinlock_t lock;
++	struct ilc_irq *irqs;
++	unsigned long **priority;
++};
++
++static LIST_HEAD(ilcs_list);
++
++#define DPRINTK(args...)
++
++/*
++ * From evt2irq to ilc2irq
++ */
++int ilc2irq(unsigned int evtcode)
++{
++	struct ilc *ilc = irq_get_handler_data(evt2irq(evtcode));
++	unsigned int priority = 14 - evt2irq(evtcode);
++	unsigned long status;
++	int idx;
++
++	for (idx = 0, status = 0;
++	     idx < DIV_ROUND_UP(ilc->inputs_num, 32) && !status;
++	     ++idx)
++		status = readl(ilc->base + ILC_BASE_STATUS + (idx << 2)) &
++			readl(ilc->base + ILC_BASE_ENABLE + (idx << 2)) &
++			ilc->priority[priority][idx];
++
++	if (!status)
++		return -1;
++
++	return ilc->first_irq + ((idx-1) * 32) + (ffs(status) - 1);
++}
++EXPORT_SYMBOL(ilc2irq);
++
++/*
++ * The interrupt demux function. Check if this was an ILC interrupt, and
++ * if so which device generated the interrupt.
++ */
++static void ilc_irq_demux(struct irq_desc *desc)
++{
++	struct ilc *ilc = irq_get_handler_data(irq_desc_get_irq(desc));
++	unsigned int priority = 14 - irq_desc_get_irq(desc);
++	int handled = 0;
++	int idx;
++
++	chained_irq_enter(irq_desc_get_chip(desc), desc);
++
++	for (idx = 0; idx < DIV_ROUND_UP(ilc->inputs_num, 32); ++idx) {
++		unsigned long status;
++		unsigned int input;
++
++		status = readl(ilc->base + ILC_BASE_STATUS + (idx << 2)) &
++			readl(ilc->base + ILC_BASE_ENABLE + (idx << 2)) &
++			ilc->priority[priority][idx];
++		if (!status)
++			continue;
++
++		input = (idx * 32) + ffs(status) - 1;
++		generic_handle_irq(input + ilc->first_irq);
++		handled = 1;
++		ILC_CLR_STATUS(ilc->base, input);
++	}
++
++	chained_irq_exit(irq_desc_get_chip(desc), desc);
++
++	if (likely(handled))
++		return;
++
++	atomic_inc(&irq_err_count);
++
++	printk(KERN_INFO "ILC: spurious interrupt demux %d\n",
++	       irq_desc_get_irq(desc));
++
++	printk(KERN_DEBUG "ILC:  inputs   status  enabled    used\n");
++
++	for (idx = 0; idx < DIV_ROUND_UP(ilc->inputs_num, 32); ++idx) {
++		unsigned long status, enabled, used;
++
++		status = readl(ilc->base + ILC_BASE_STATUS + (idx << 2));
++		enabled = readl(ilc->base + ILC_BASE_ENABLE + (idx << 2));
++		used = 0;
++		for (priority = 0; priority < ilc->outputs_num; ++priority)
++			used |= ilc->priority[priority][idx];
++
++		printk(KERN_DEBUG "ILC: %3d-%3d: %08lx %08lx %08lx"
++				"\n", idx * 32, (idx * 32) + 31,
++				status, enabled, used);
++	}
++}
++
++static unsigned int startup_ilc_irq(struct irq_data *d)
++{
++	struct ilc *ilc = irq_data_get_irq_chip_data(d);
++	unsigned int priority;
++	unsigned long flags;
++	int input = d->irq - ilc->first_irq;
++	struct ilc_irq *ilc_irq;
++
++	if ((input < 0) || (input >= ilc->inputs_num))
++		return -ENODEV;
++
++	ilc_irq = &ilc->irqs[input];
++	priority = ilc_irq->priority;
++
++	spin_lock_irqsave(&ilc->lock, flags);
++	ilc_set_used(ilc_irq);
++	ilc_set_enabled(ilc_irq);
++	ilc->priority[priority][_BANK(input)] |= _BIT(input);
++	spin_unlock_irqrestore(&ilc->lock, flags);
++
++	ILC_SET_PRI(ilc->base, input, priority);
++
++	ILC_SET_ENABLE(ilc->base, input);
++
++	return 0;
++}
++
++static void shutdown_ilc_irq(struct irq_data *d)
++{
++	struct ilc *ilc = irq_data_get_irq_chip_data(d);
++	struct ilc_irq *ilc_irq;
++	unsigned int priority;
++	unsigned long flags;
++	int input = d->irq - ilc->first_irq;
++
++	WARN_ON(!ilc_is_used(&ilc->irqs[input]));
++
++	if ((input < 0) || (input >= ilc->inputs_num))
++		return;
++
++	ilc_irq = &ilc->irqs[input];
++	priority = ilc_irq->priority;
++
++	ILC_CLR_ENABLE(ilc->base, input);
++	ILC_SET_PRI(ilc->base, input, 0);
++
++	spin_lock_irqsave(&ilc->lock, flags);
++	ilc_set_disabled(ilc_irq);
++	ilc_set_unused(ilc_irq);
++	ilc->priority[priority][_BANK(input)] &= ~(_BIT(input));
++	spin_unlock_irqrestore(&ilc->lock, flags);
++}
++
++static void unmask_ilc_irq(struct irq_data *d)
++{
++	struct ilc *ilc = irq_data_get_irq_chip_data(d);
++	int input = d->irq - ilc->first_irq;
++	struct ilc_irq *ilc_irq = &ilc->irqs[input];
++
++	ILC_SET_ENABLE(ilc->base, input);
++	ilc_set_enabled(ilc_irq);
++}
++
++static void mask_ilc_irq(struct irq_data *d)
++{
++	struct ilc *ilc = irq_data_get_irq_chip_data(d);
++	int input = d->irq - ilc->first_irq;
++	struct ilc_irq *ilc_irq = &ilc->irqs[input];
++
++	ILC_CLR_ENABLE(ilc->base, input);
++	ilc_set_disabled(ilc_irq);
++}
++
++static void mask_and_ack_ilc(struct irq_data *d)
++{
++	struct ilc *ilc = irq_data_get_irq_chip_data(d);
++	int input = d->irq - ilc->first_irq;
++	struct ilc_irq *ilc_irq = &ilc->irqs[input];
++
++	ILC_CLR_ENABLE(ilc->base, input);
++	(void)ILC_GET_ENABLE(ilc->base, input); /* Defeat write posting */
++	ilc_set_disabled(ilc_irq);
++}
++
++static int set_type_ilc_irq(struct irq_data *d, unsigned int flow_type)
++{
++	struct ilc *ilc = irq_data_get_irq_chip_data(d);
++	int input = d->irq - ilc->first_irq;
++	int mode;
++
++	switch (flow_type) {
++	case IRQ_TYPE_EDGE_RISING:
++		mode = ILC_TRIGGERMODE_RISING;
++		break;
++	case IRQ_TYPE_EDGE_FALLING:
++		mode = ILC_TRIGGERMODE_FALLING;
++		break;
++	case IRQ_TYPE_EDGE_BOTH:
++		mode = ILC_TRIGGERMODE_ANY;
++		break;
++	case IRQ_TYPE_LEVEL_HIGH:
++		mode = ILC_TRIGGERMODE_HIGH;
++		break;
++	case IRQ_TYPE_LEVEL_LOW:
++		mode = ILC_TRIGGERMODE_LOW;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	ILC_SET_TRIGMODE(ilc->base, input, mode);
++	ilc->irqs[input].trigger_mode = (unsigned char)mode;
++
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int set_wake_ilc_irq(struct irq_data *d, unsigned int on)
++{
++	struct ilc *ilc = irq_data_get_irq_chip_data(d);
++	int input = d->irq - ilc->first_irq;
++	struct ilc_irq *ilc_irq = &ilc->irqs[input];
++
++	if (ilc->disable_wakeup)
++		return 0;
++
++	if (on) {
++		ilc_set_wakeup(ilc_irq);
++		ILC_WAKEUP_ENABLE(ilc->base, input);
++		ILC_WAKEUP(ilc->base, input, 1);
++	} else {
++		ilc_reset_wakeup(ilc_irq);
++		ILC_WAKEUP_DISABLE(ilc->base, input);
++	}
++
++	return 0;
++}
++#else
++#define set_wake_ilc_irq	NULL
++#endif	/* CONFIG_PM_SLEEP */
++
++static struct irq_chip ilc_chip = {
++	.name		= "ILC3",
++	.irq_startup	= startup_ilc_irq,
++	.irq_shutdown	= shutdown_ilc_irq,
++	.irq_mask	= mask_ilc_irq,
++	.irq_mask_ack	= mask_and_ack_ilc,
++	.irq_unmask	= unmask_ilc_irq,
++	.irq_set_type	= set_type_ilc_irq,
++	.irq_set_wake	= set_wake_ilc_irq,
++};
++
++/*
++ * Allocate a fixed irq descriptor (sparse IRQs are the default on SH).
++ */
++static int ilc_alloc_irq(unsigned int irq)
++{
++	if (irq_to_desc(irq))
++		return 0;
++
++	return irq_alloc_desc_at(irq, NUMA_NO_NODE) == irq ? 0 : -EBUSY;
++}
++
++static void ilc_demux_init(struct platform_device *pdev)
++{
++	struct ilc *ilc = platform_get_drvdata(pdev);
++	int irq;
++	int i;
++
++	/* Default all interrupts to active high. */
++	for (i = 0, irq = ilc->first_irq; i < ilc->inputs_num; i++, irq++) {
++		ILC_SET_TRIGMODE(ilc->base, i, ILC_TRIGGERMODE_HIGH);
++
++		if (ilc_alloc_irq(irq))
++			continue;
++
++		irq_set_chip_and_handler_name(irq, &ilc_chip,
++				handle_level_irq, ilc->name);
++		irq_set_chip_data(irq, ilc);
++	}
++
++	i = 0;
++	irq = platform_get_irq(pdev, i++);
++	while (irq >= 0) {
++		if (!ilc_alloc_irq(irq))
++			irq_set_chained_handler_and_data(irq, ilc_irq_demux,
++							 ilc);
++		irq = platform_get_irq(pdev, i++);
++	}
++}
++
++static int ilc_probe(struct platform_device *pdev)
++{
++	struct stx7105_ilc3_data *pdata = pdev->dev.platform_data;
++	struct resource *memory;
++	int memory_size;
++	struct ilc *ilc;
++	int i;
++
++	memory = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!memory)
++		return -EINVAL;
++	memory_size = resource_size(memory);
++
++	if (!request_mem_region(memory->start, memory_size, pdev->name))
++		return -EBUSY;
++
++	ilc = kzalloc(sizeof(struct ilc), GFP_KERNEL);
++	if (!ilc)
++		return -ENOMEM;
++	platform_set_drvdata(pdev, ilc);
++
++	ilc->clk = clk_get(&pdev->dev, "comms_clk");
++	if (!IS_ERR(ilc->clk))
++		clk_enable(ilc->clk); /* Just to increase the usage_counter */
++
++	spin_lock_init(&ilc->lock);
++
++	ilc->name = dev_name(&pdev->dev);
++	ilc->inputs_num = pdata->inputs_num;
++	ilc->outputs_num = pdata->outputs_num;
++	ilc->first_irq = pdata->first_irq;
++	ilc->disable_wakeup = pdata->disable_wakeup;
++
++	ilc->base = ioremap(memory->start, memory_size);
++	if (!ilc->base)
++		return -ENOMEM;
++
++	ilc->irqs = kzalloc(sizeof(struct ilc_irq) * ilc->inputs_num,
++			GFP_KERNEL);
++	if (!ilc->irqs)
++		return -ENOMEM;
++
++	for (i = 0; i < ilc->inputs_num; ++i) {
++		ilc->irqs[i].priority = 7;
++		ilc->irqs[i].trigger_mode = ILC_TRIGGERMODE_HIGH;
++	}
++
++	ilc->priority = kzalloc(ilc->outputs_num * sizeof(long *), GFP_KERNEL);
++	if (!ilc->priority)
++		return -ENOMEM;
++
++	for (i = 0; i < ilc->outputs_num; ++i) {
++		ilc->priority[i] = kzalloc(sizeof(long) *
++				DIV_ROUND_UP(ilc->inputs_num, 32), GFP_KERNEL);
++		if (!ilc->priority[i])
++			return -ENOMEM;
++	}
++
++	ilc_demux_init(pdev);
++
++	list_add(&ilc->list, &ilcs_list);
++
++	return 0;
++}
++
++static struct platform_driver ilc_driver = {
++	.driver	= {
++		.name = DRIVER_NAME,
++	},
++	.probe = ilc_probe,
++};
++
++#if defined(CONFIG_DEBUG_FS)
++
++static void *ilc_seq_start(struct seq_file *s, loff_t *pos)
++{
++	seq_printf(s, "input irq status enabled used priority mode wakeup\n");
++
++	return seq_list_start(&ilcs_list, *pos);
++}
++
++static void *ilc_seq_next(struct seq_file *s, void *v, loff_t *pos)
++{
++	return seq_list_next(v, &ilcs_list, pos);
++}
++
++static void ilc_seq_stop(struct seq_file *s, void *v)
++{
++}
++
++static int ilc_seq_show(struct seq_file *s, void *v)
++{
++	struct ilc *ilc = list_entry(v, struct ilc, list);
++	int i, status, enabled, used, wakeup;
++
++	seq_printf(s, "ILC: %s\n", ilc->name);
++	for (i = 0; i < ilc->inputs_num; ++i) {
++		status = (ILC_GET_STATUS(ilc->base, i) != 0);
++		enabled = (ILC_GET_ENABLE(ilc->base, i) != 0);
++		used = ilc_is_used(&ilc->irqs[i]);
++		wakeup = ilc_wakeup_enabled(&ilc->irqs[i]);
++		seq_printf(s, "%3d %3d %d %d %d %d %d %d",
++			i, i + ilc->first_irq,
++			status, enabled, used,
++			readl(ilc->base + ILC_PRIORITY_REG(i)),
++			readl(ilc->base + ILC_TRIGMODE_REG(i)), wakeup);
++		if (enabled && !used)
++			seq_printf(s, " !!!");
++		seq_printf(s, "\n");
++	}
++
++	return 0;
++}
++
++static const struct seq_operations ilc_seq_ops = {
++	.start = ilc_seq_start,
++	.next = ilc_seq_next,
++	.stop = ilc_seq_stop,
++	.show = ilc_seq_show,
++};
++
++static int ilc_proc_open(struct inode *inode, struct file *file)
++{
++	return seq_open(file, &ilc_seq_ops);
++}
++
++static const struct file_operations ilc_debugfs_ops = {
++	.open = ilc_proc_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = seq_release,
++};
++
++static int __init ilc_debugfs_init(void)
++{
++	debugfs_create_file("ilc", 0444, NULL, NULL, &ilc_debugfs_ops);
++
++	return 0;
++}
++subsys_initcall(ilc_debugfs_init);
++
++#endif /* CONFIG_DEBUG_FS */
++
++#ifdef CONFIG_KEXEC
++void ilc_disable_all(void)
++{
++	unsigned int input;
++	struct ilc *ilc;
++
++	/* Don't care to sync irq status with ILC, as the current kernel
++	 * is going to die. Switching-off only the hardware. */
++
++	list_for_each_entry(ilc, &ilcs_list, list) {
++		for (input = 0; input < ilc->inputs_num; ++input) {
++			if (ILC_GET_ENABLE(ilc->base, input) != 0) {
++				DPRINTK("%s: disabling irq %d\n", __func__,
++					input + ilc->first_irq);
++				ILC_CLR_ENABLE(ilc->base, input);
++			}
++		}
++	}
++}
++#endif
++
++#ifdef CONFIG_HIBERNATION
++
++static int ilc_resume_from_hibernation(struct ilc *ilc)
++{
++	unsigned long flag;
++	int i;
++
++	local_irq_save(flag);
++	for (i = 0; i < ilc->inputs_num; ++i) {
++		int irq = i + ilc->first_irq;
++		struct irq_data *d = irq_get_irq_data(irq);
++
++		ILC_SET_PRI(ilc->base, i, ilc->irqs[i].priority);
++		ILC_SET_TRIGMODE(ilc->base, i, ilc->irqs[i].trigger_mode);
++		if (ilc_is_used(&ilc->irqs[i])) {
++			startup_ilc_irq(d);
++			if (ilc_is_enabled(&ilc->irqs[i]))
++				unmask_ilc_irq(d);
++			else
++				mask_ilc_irq(d);
++		}
++	}
++	local_irq_restore(flag);
++	return 0;
++}
++
++static void ilc_syscore_resume(void)
++{
++	struct ilc *ilc;
++
++	list_for_each_entry(ilc, &ilcs_list, list)
++		ilc_resume_from_hibernation(ilc);
++}
++
++static struct syscore_ops ilc_syscore = {
++	.resume = ilc_syscore_resume,
++};
++
++static int __init ilc_syscore_init(void)
++{
++	register_syscore_ops(&ilc_syscore);
++	return 0;
++}
++subsys_initcall(ilc_syscore_init);
++
++#endif /* CONFIG_HIBERNATION */
++
++static int __init ilc_init(void)
++{
++	return platform_driver_register(&ilc_driver);
++}
++core_initcall(ilc_init);
+--- a/arch/sh/kernel/cpu/irq/ilc3.h
++++ b/arch/sh/kernel/cpu/irq/ilc3.h
+@@ -0,0 +1,77 @@
++/*
++ * Copyright (C) 2003-2010 STMicroelectronics Limited
++ *
++ * May be copied or modified under the terms of the GNU General Public
++ * License.  See linux/COPYING for more information.
++ *
++ * Interrupt handling for STMicroelectronics Interrupt Level Controler (ILC).
++ */
++
++#ifndef __ARCH_SH_KERNEL_CPU_IRQ_ILC3_H
++#define __ARCH_SH_KERNEL_CPU_IRQ_ILC3_H
++
++#define _BIT(_int)		     (1 << (_int % 32))
++#define _REG_OFF(_int)		     (sizeof(int) * (_int / 32))
++#define _BANK(_irq)		     ((_irq) >> 5)
++
++#define ILC_BASE_STATUS              0x200
++#define ILC_BASE_ENABLE              0x400
++
++#define ILC_INTERRUPT_REG(_int)      (0x080 + _REG_OFF(_int))
++#define ILC_STATUS_REG(_int)         (0x200 + _REG_OFF(_int))
++#define ILC_CLR_STATUS_REG(_int)     (0x280 + _REG_OFF(_int))
++#define ILC_ENABLE_REG(_int)         (0x400 + _REG_OFF(_int))
++#define ILC_CLR_ENABLE_REG(_int)     (0x480 + _REG_OFF(_int))
++#define ILC_SET_ENABLE_REG(_int)     (0x500 + _REG_OFF(_int))
++
++#define ILC_EXT_WAKEUP_EN(_int)	     (0x600 + _REG_OFF(_int))
++#define ILC_EXT_WAKPOL_EN(_int)	     (0x680 + _REG_OFF(_int))
++
++#define ILC_PRIORITY_REG(_int)       (0x800 + (8 * _int))
++#define ILC_TRIGMODE_REG(_int)       (0x804 + (8 * _int))
++
++/*
++ * Macros to get/set/clear ILC registers
++ */
++#define ILC_SET_ENABLE(_base, _int) \
++		writel(_BIT(_int), _base + ILC_SET_ENABLE_REG(_int))
++#define ILC_CLR_ENABLE(_base, _int) \
++		writel(_BIT(_int), _base + ILC_CLR_ENABLE_REG(_int))
++#define ILC_GET_ENABLE(_base, _int) \
++		(readl(_base + ILC_ENABLE_REG(_int)) & _BIT(_int))
++
++#define ILC_CLR_STATUS(_base, _int) \
++		writel(_BIT(_int), _base + ILC_CLR_STATUS_REG(_int))
++#define ILC_GET_STATUS(_base, _int) \
++		(readl(_base + ILC_STATUS_REG(_int)) & _BIT(_int))
++
++#define ILC_SET_PRI(_base, _int, _pri) \
++		writel((_pri), _base + ILC_PRIORITY_REG(_int))
++
++#define ILC_SET_TRIGMODE(_base, _int, _mod) \
++		writel((_mod), _base + ILC_TRIGMODE_REG(_int))
++
++#define ILC_WAKEUP_ENABLE(_base, _int) \
++		writel(readl(_base + ILC_EXT_WAKEUP_EN(_int)) |	\
++				_BIT(_int), _base + ILC_EXT_WAKEUP_EN(_int))
++#define ILC_WAKEUP_DISABLE(_base, _int) \
++		writel(readl(_base + ILC_EXT_WAKEUP_EN(_int)) & \
++				~_BIT(_int), _base + ILC_EXT_WAKEUP_EN(_int))
++#define ILC_WAKEUP_HI(_base, _int) \
++		writel(readl(_base + ILC_EXT_WAKPOL_EN(_int)) | \
++				_BIT(_int), _base + ILC_EXT_WAKPOL_EN(_int))
++#define ILC_WAKEUP_LOW(_base, _int) \
++		writel(readl(_base + ILC_EXT_WAKPOL_EN(_int)) & \
++				~_BIT(_int), _base + ILC_EXT_WAKPOL_EN(_int))
++#define ILC_WAKEUP(_base, _int, _high) \
++		((_high) ? (ILC_WAKEUP_HI(_base, _int)) : \
++				(ILC_WAKEUP_LOW(_base, _int)))
++
++#define ILC_TRIGGERMODE_NONE	0
++#define ILC_TRIGGERMODE_HIGH	1
++#define ILC_TRIGGERMODE_LOW	2
++#define ILC_TRIGGERMODE_RISING	3
++#define ILC_TRIGGERMODE_FALLING	4
++#define ILC_TRIGGERMODE_ANY	5
++
++#endif
+--- a/arch/sh/include/asm/irq-ilc.h
++++ b/arch/sh/include/asm/irq-ilc.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Interrupt Level Controller (ILC3) definitions for ST40 SoCs.
++ *
++ * Copyright (C) 2008 STMicroelectronics Limited
++ * Author: Stuart Menefy <stuart.menefy@st.com>
++ */
++#ifndef __ASM_SH_IRQ_ILC_H
++#define __ASM_SH_IRQ_ILC_H
++
++struct stx7105_ilc3_data {
++	unsigned int inputs_num;
++	unsigned int outputs_num;
++	unsigned int first_irq;
++	int disable_wakeup;
++};
++
++#if defined(CONFIG_CPU_SUBTYPE_STX7105)
++#define ILC_FIRST_IRQ	176
++#define ILC_NR_IRQS	(64 + 42)
++#define ILC_INT_IRQ(x)	(ILC_FIRST_IRQ + (x))
++#define ILC_EXT_IRQ(x)	(ILC_FIRST_IRQ + 64 + (x))
++#define ILC_IRQ(x)	ILC_INT_IRQ(x)
++#endif
++
++void __init ilc_early_init(struct platform_device *pdev);
++int ilc2irq(unsigned int evtcode);
++void ilc_disable_all(void);
++
++#endif /* __ASM_SH_IRQ_ILC_H */

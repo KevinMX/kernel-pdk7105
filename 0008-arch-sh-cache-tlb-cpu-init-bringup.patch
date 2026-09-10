@@ -1,0 +1,227 @@
+--- a/arch/sh/kernel/cpu/init.c
++++ b/arch/sh/kernel/cpu/init.c
+@@ -19,10 +19,18 @@
+ #include <asm/cache.h>
+ #include <asm/elf.h>
+ #include <asm/io.h>
++#include <asm/uncached.h>
+ #include <asm/smp.h>
+ #include <asm/sh_bios.h>
+ #include <asm/setup.h>
+ 
++/*
++ * Uncached alias of an address in the cached P1 window: on ST40 SE mode,
++ * setting bit 28 gives the uncached twin mapped through the same PMB entry,
++ * with no 16 MB window limitation.
++ */
++#define UNCACHED_TWIN(addr)	((unsigned long)(addr) | 0x10000000)
++
+ #ifdef CONFIG_SH_FPU
+ #define cpu_has_fpu	1
+ #else
+@@ -108,30 +116,31 @@
+ {
+ 	unsigned long ccr, flags;
+ 
+-	jump_to_uncached();
++
++	/* Record the current PMB state for post-mortem analysis */
++
++	/*
++	 * The caches are already disabled in head_32.S, so executing from
++	 * the cached mapping is fine and the uncached jump (which relies
++	 * on a bootloader-provided alias entry) is not needed.
++	 */
+ 	ccr = __raw_readl(SH_CCR);
+ 
+ 	/*
+-	 * At this point we don't know whether the cache is enabled or not - a
+-	 * bootloader may have enabled it.  There are at least 2 things that
+-	 * could be dirty in the cache at this point:
+-	 * 1. kernel command line set up by boot loader
+-	 * 2. spilled registers from the prolog of this function
+-	 * => before re-initialising the cache, we must do a purge of the whole
+-	 * cache out to memory for safety.  As long as nothing is spilled
+-	 * during the loop to lines that have already been done, this is safe.
+-	 * - RPC
++	 * Bring-up: the purge loop below writes through the OC address
++	 * array while executing from cached memory; on this ST40 board
++	 * that combination hangs depending on code layout.  u-boot hands
++	 * over with caches enabled, so we simply skip the purge and let
++	 * the CCR invalidate below discard any dirty lines.  The boot
++	 * command line is read by the kernel before this point and is
++	 * re-readable from RAM, so nothing critical is lost.
+ 	 */
+-	if (ccr & CCR_CACHE_ENABLE) {
++	if (0 && (ccr & CCR_CACHE_ENABLE)) {
+ 		unsigned long ways, waysize, addrstart;
+ 
+ 		waysize = current_cpu_data.dcache.sets;
+ 
+ #ifdef CCR_CACHE_ORA
+-		/*
+-		 * If the OC is already in RAM mode, we only have
+-		 * half of the entries to flush..
+-		 */
+ 		if (ccr & CCR_CACHE_ORA)
+ 			waysize >>= 1;
+ #endif
+@@ -139,7 +148,6 @@
+ 		waysize <<= current_cpu_data.dcache.entry_shift;
+ 
+ #ifdef CCR_CACHE_EMODE
+-		/* If EMODE is not set, we only have 1 way to flush. */
+ 		if (!(ccr & CCR_CACHE_EMODE))
+ 			ways = 1;
+ 		else
+@@ -160,13 +168,14 @@
+ 	}
+ 
+ 	/*
+-	 * Default CCR values .. enable the caches
+-	 * and invalidate them immediately..
++	 * Bring-up: leave the caches DISABLED here.  Enabling them from
++	 * cached P1 code is layout-sensitive on this ST40 (I-cache
++	 * invalidate + refetch race); they get enabled later, after the
++	 * PMB has been fully initialized, from mem_init().
+ 	 */
+-	flags = CCR_CACHE_ENABLE | CCR_CACHE_INVALIDATE;
++	flags = 0;
+ 
+ #ifdef CCR_CACHE_EMODE
+-	/* Force EMODE if possible */
+ 	if (current_cpu_data.dcache.ways > 1)
+ 		flags |= CCR_CACHE_EMODE;
+ 	else
+@@ -174,20 +183,16 @@
+ #endif
+ 
+ #if defined(CONFIG_CACHE_WRITETHROUGH)
+-	/* Write-through */
+ 	flags |= CCR_CACHE_WT;
+ #elif defined(CONFIG_CACHE_WRITEBACK)
+-	/* Write-back */
+ 	flags |= CCR_CACHE_CB;
+ #else
+-	/* Off */
+ 	flags &= ~CCR_CACHE_ENABLE;
+ #endif
+ 
+ 	l2_cache_init();
+ 
+-	__raw_writel(flags, SH_CCR);
+-	back_to_cached();
++
+ }
+ #else
+ #define cache_init()	do { } while (0)
+@@ -294,6 +299,10 @@
+  */
+ asmlinkage void cpu_init(void)
+ {
++
++	/* Record CPU probe registers for post-mortem (SDRAM survives reset) */
++
++
+ 	current_thread_info()->cpu = hard_smp_processor_id();
+ 
+ 	/* First, probe the CPU */
+@@ -335,6 +344,7 @@
+ 	fpu_init();
+ 	dsp_init();
+ 
++
+ 	/*
+ 	 * Initialize the per-CPU ASID cache very early, since the
+ 	 * TLB flushing routines depend on this being setup.
+@@ -346,6 +356,7 @@
+ 	speculative_execution_init();
+ 	expmask_init();
+ 
++
+ 	/* Do the rest of the boot processor setup */
+ 	if (raw_smp_processor_id() == 0) {
+ 		/* Save off the BIOS VBR, if there is one */
+--- a/arch/sh/mm/cache.c
++++ b/arch/sh/mm/cache.c
+@@ -141,6 +141,11 @@
+ void __update_cache(struct vm_area_struct *vma,
+ 		    unsigned long address, pte_t pte)
+ {
++	/*
++	 * Bring-up: __flush_purge_region() uses ocbp, which hangs on this
++	 * ST40 (same as ocbwb), so the dcache-alias flush is skipped.
++	 */
++	return;
+ 	unsigned long pfn = pte_pfn(pte);
+ 
+ 	if (!boot_cpu_data.dcache.n_aliases)
+--- a/arch/sh/mm/tlb-sh4.c
++++ b/arch/sh/mm/tlb-sh4.c
+@@ -17,6 +17,7 @@
+ {
+ 	unsigned long flags, pteval, vpn;
+ 
++
+ 	/*
+ 	 * Handle debugger faulting in for debugee.
+ 	 */
+@@ -64,6 +65,13 @@
+ 
+ void local_flush_tlb_one(unsigned long asid, unsigned long page)
+ {
++	/*
++	 * Bring-up: the UTLB address-array write (with the ASSOC bit)
++	 * hangs on this ST40 for some addresses. Use the MMUCR-based
++	 * full TLB flush instead, which is known to work.
++	 */
++	__raw_writel(__raw_readl(MMUCR) | MMUCR_TI, MMUCR);
++	return;
+ 	unsigned long addr, data;
+ 
+ 	/*
+--- a/arch/sh/mm/tlbex_32.c
++++ b/arch/sh/mm/tlbex_32.c
+@@ -30,6 +30,7 @@
+ 	pte_t *pte;
+ 	pte_t entry;
+ 
++
+ 	/*
+ 	 * We don't take page faults for P1, P2, and parts of P4, these
+ 	 * are always mapped, whether it be due to legacy behaviour in
+@@ -66,6 +67,7 @@
+ 
+ 	set_pte(pte, entry);
+ 
++
+ #if defined(CONFIG_CPU_SH4) && !defined(CONFIG_SMP)
+ 	/*
+ 	 * SH-4 does not set MMUCR.RC to the corresponding TLB entry in
+--- a/arch/sh/mm/init.c
++++ b/arch/sh/mm/init.c
+@@ -30,6 +30,7 @@
+ #include <asm/pgalloc.h>
+ #include <linux/sizes.h>
+ #include "ioremap.h"
++#include <asm/uncached.h>
+ 
+ pgd_t swapper_pg_dir[PTRS_PER_PGD];
+ 
+@@ -305,6 +306,8 @@
+ 
+ 	uncached_init();
+ 	pmb_init();
++
++
+ 	do_init_bootmem();
+ 	ioremap_fixed_init();
+ 
+@@ -337,6 +340,7 @@
+ 
+ void __init mem_init(void)
+ {
++
+ 	pg_data_t *pgdat;
+ 
+ 	high_memory = NULL;

@@ -1,0 +1,138 @@
+--- a/arch/sh/kernel/head_32.S
++++ b/arch/sh/kernel/head_32.S
+@@ -54,9 +54,69 @@
+  *   Hardware (including on-chip modules) may or may not be initialized. 
+  *
+  */
++/*
++ * Early console: create a temporary PMB entry for the ASC2 console.
++ * At kernel entry (after the TWPDA u-boot SE-mode dance) only PMB[0] is valid
++ * (0x80000000 -> LMI), so the ASC at phys 0xfd032000 is unreachable. We add
++ * PMB[15]: 0xB8000000 -> 0xfd000000 (16MB, uncached); the mainline PMB
++ * reconfiguration below preserves entry 15 (it clears 3..14 only).
++ * ASC2: STA @ +0x14 (THE = bit 2), TXBUF @ +0x04 -> poke at 0xB8032004.
++ * All addresses are built with register arithmetic (no PC-relative loads,
++ * immune to literal-pool range limits).
++ */
++	.macro	early_pmb_setup
++	mov	#0xF6, r0
++	shll8	r0
++	mov	#0x10, r1
++	or	r1, r0
++	shll8	r0
++	mov	#0x0F, r1
++	or	r1, r0
++	shll8	r0		! r0 = 0xf6100f00 (PMB_ADDR(15))
++	mov	#0, r1
++	mov.l	r1, @r0		! clear entry
++	mov	#0xB8, r1
++	shll8	r1
++	shll8	r1
++	shll8	r1		! r1 = 0xB8000000 (VPN)
++	mov.l	r1, @r0		! set VPN
++	mov	#0xF7, r2
++	shll8	r2
++	mov	#0x10, r1
++	or	r1, r2
++	shll8	r2
++	mov	#0x0F, r1
++	or	r1, r2
++	shll8	r2		! r2 = 0xf7100f00 (PMB_DATA(15))
++	mov	#0xFD, r1
++	shll8	r1
++	shll8	r1
++	mov	#0x03, r0
++	or	r0, r1
++	shll8	r1		! r1 = 0xfd000300 (PPN | UB | V)
++	mov.l	r1, @r2		! set DATA
++	.endm
++
++
++
+ ENTRY(_stext)
++	early_pmb_setup
++	! Disable and invalidate the I/D caches for a deterministic early
++	! boot (the bootloader may leave them enabled with unknown state).
++	! cache_init() re-enables them properly later.
++	mov	#-1, r0
++	shll8	r0
++	shll8	r0
++	shll8	r0		! r0 = 0xFF000000
++	mov	#0x1C, r1
++	or	r1, r0		! r0 = 0xFF00001C (SH_CCR)
++	mov	#0x08, r1
++	shll8	r1
++	mov	#0x08, r0
++	or	r0, r1		! r1 = 0x0808 (ICI | OCI)
++	mov.l	r1, @r0
+ 	!			Initialize Status Register
+-	mov.l	1f, r0		! MD=1, RB=0, BL=0, IMASK=0xF
++	mov.l	.Learly_pool, r0	! MD=1, RB=0, BL=1, FD=1, IMASK=0xF
+ 	ldc	r0, sr
+ 	!			Initialize global interrupt mask
+ #ifdef CONFIG_CPU_HAS_SR_RB
+@@ -79,12 +139,23 @@
+ 	PREFI(6f, r0)
+ 
+ 	!
+-	mov.l	2f, r0
++	mov.l	.Learly_pool + 4, r0
+ 	mov	r0, r15		! Set initial r15 (stack pointer)
+ #ifdef CONFIG_CPU_HAS_SR_RB
+-	mov.l	7f, r0
++	mov.l	.Learly_pool + 8, r0
+ 	ldc	r0, r7_bank	! ... and initial thread_info
+ #endif
++	! Early literal pool: the end-of-file pool drifted out of mov.l
++	! @(disp,pc) range, so keep the SR/stack/thread_info constants here,
++	! skipped by a branch (a plain pool would be executed as code).
++	.balign	4
++	bra	.Learly_pool_end
++	 nop
++.Learly_pool:
++	.long	0x500080F0	! SR: MD=1, RB=0, BL=1, FD=1, IMASK=0xF
++	.long	init_thread_union + THREAD_SIZE	! stack_start
++	.long	init_thread_union		! init_thread_info
++.Learly_pool_end:
+ 
+ #ifdef CONFIG_PMB
+ /*
+@@ -274,9 +345,12 @@
+ 	 *
+ 	 * r3 = entry to begin clearing from
+ 	 * r10 = number of entries we've setup so far
++	 *
++	 * Entry 15 is preserved: early_pmb_setup() installs a temporary
++	 * ASC console mapping there.
+ 	 */
+ 	mov	#0, r1
+-	mov	#NR_PMB_ENTRIES, r0
++	mov	#(NR_PMB_ENTRIES - 4), r0
+ 
+ .Lagain:
+ 	mov.l	r1, @r3		/* Clear PMB_ADDR entry */
+@@ -312,7 +386,7 @@
+ 	bf/s	9b		! while (r1 < r2)
+ 	 mov.l	r0,@-r2
+ 
+-10:		
++10:
+ #endif
+ 
+ #ifdef CONFIG_OF_EARLY_FLATTREE
+@@ -327,7 +401,8 @@
+ 	 nop
+ 
+ 	SYNCO()			! Wait for pending instructions..
+-	
++
++
+ 	!			Start kernel
+ 	mov.l	5f, r0
+ 	jmp	@r0
+@@ -362,4 +437,5 @@
+ .Lcached_to_uncached:	.long	cached_to_uncached
+ .Luncached_size:	.long	uncached_size
+ #endif
++
+ #endif

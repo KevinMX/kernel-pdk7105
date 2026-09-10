@@ -1,0 +1,14 @@
+0001-arch-sh-ST40-subtypes.patch
+0002-arch-sh-ILC3-interrupt-controller.patch
+0003-arch-sh-STx7105-SoC-setup.patch
+0004-arch-sh-PDK7105-board.patch
+0005-arch-sh-ST40-PMB.patch
+0006-serial-st-asc-for-SuperH.patch
+0007-arch-sh-ST40-cpu-identification.patch
+0008-arch-sh-cache-tlb-cpu-init-bringup.patch
+0009-arch-sh-pdk7105-board-ethernet-usb.patch
+0010-arch-sh-stx7105-soc-tmu.patch
+0011-arch-sh-head-early-console-stack.patch
+0012-arch-sh-st40-pmb-bringup.patch
+0013-serial-st-asc-polling-console.patch
+0014-mm-initmem-and-cleanup.patch

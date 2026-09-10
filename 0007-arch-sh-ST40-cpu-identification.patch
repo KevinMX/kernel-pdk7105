@@ -1,0 +1,71 @@
+--- a/arch/sh/include/asm/processor.h
++++ b/arch/sh/include/asm/processor.h
+@@ -31,6 +31,9 @@
+ 	CPU_SH7750, CPU_SH7750S, CPU_SH7750R, CPU_SH7751, CPU_SH7751R,
+ 	CPU_SH7760, CPU_SH4_202, CPU_SH4_501,
+ 
++	/* ST40 (STMicroelectronics) types */
++	CPU_STX7105,
++
+ 	/* SH-4A types */
+ 	CPU_SH7763, CPU_SH7770, CPU_SH7780, CPU_SH7781, CPU_SH7785, CPU_SH7786,
+ 	CPU_SH7723, CPU_SH7724, CPU_SH7757, CPU_SH7734, CPU_SHX3,
+--- a/arch/sh/include/asm/processor_32.h
++++ b/arch/sh/include/asm/processor_32.h
+@@ -19,6 +19,7 @@
+ #define CCN_PVR		0xff000030
+ #define CCN_CVR		0xff000040
+ #define CCN_PRR		0xff000044
++#define CCN_RAMCR	0xff000074	/* ST40-300 */
+ 
+ /*
+  * User space process size: 2GB.
+--- a/arch/sh/kernel/cpu/sh3/entry.S
++++ b/arch/sh/kernel/cpu/sh3/entry.S
+@@ -470,10 +470,20 @@
+ 	mov	r4, r0		! save vector->jmp table offset for later
+ 
+ 	shlr2	r4		! vector to IRQ# conversion
++#ifdef CONFIG_CPU_ST40_300
++	/*
++	 * ST40 cores deliver INTEVT codes with a 16 IRQ offset (see
++	 * evt2irq() in include/linux/sh_intc.h): irq = (evt >> 5) - 16.
++	 */
++	add	#-0x10, r4
+ 
++	cmp/pz	r4		! is it a valid IRQ?
++	bt	10f
++#else
+ 	mov	#0x10, r5
+ 	cmp/hs	r5, r4		! is it a valid IRQ?
+ 	bt	10f
++#endif
+ 
+ 	/*
+ 	 * We got here as a result of taking the INTEVT path for something
+--- a/arch/sh/kernel/cpu/sh4/probe.c
++++ b/arch/sh/kernel/cpu/sh4/probe.c
+@@ -165,6 +165,23 @@
+ 	case 0x4001:	/* 2nd cut */
+ 		boot_cpu_data.type = CPU_SHX3;
+ 		break;
++	case 0x9090 ... 0x9094:
++		/* ST40-300 core (STMicroelectronics STx7105 etc.) */
++		boot_cpu_data.type = CPU_STX7105;
++		boot_cpu_data.flags |= CPU_HAS_FPU;
++		boot_cpu_data.flags &= ~CPU_HAS_PTEA;
++		/*
++		 * The I/D-cache way count is strap-configured via RAMCR.
++		 * With ways > 1 the generic CVR-based cache sizing below
++		 * fills in sets/way_incr, and cache_init keeps CCR.EMODE set.
++		 */
++		{
++			unsigned long ramcr = __raw_readl(CCN_RAMCR);
++
++			boot_cpu_data.icache.ways = (ramcr & (1 << 7)) ? 2 : 4;
++			boot_cpu_data.dcache.ways = (ramcr & (1 << 6)) ? 2 : 4;
++		}
++		break;
+ 	case 0x700:
+ 		boot_cpu_data.type = CPU_SH4_501;
+ 		boot_cpu_data.flags &= ~CPU_HAS_FPU;
